@@ -2,6 +2,7 @@
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const LOGO_PATH = path.join(__dirname, '..', 'assets', 'unostar-logo.png');
 
@@ -10,7 +11,7 @@ function fmtDate(d) {
 }
 
 function renderReportPdf(agg) {
-  const dir = path.join(__dirname, '..', 'tmp');
+  const dir = path.join(os.tmpdir(), 'unostar-reports');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, `report-${agg.period}-${agg.label}.pdf`);
 
