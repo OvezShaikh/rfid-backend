@@ -14,6 +14,7 @@ const whatsappWebhookController = require('./controllers/whatsappWebhookControll
 const deviceRoutes = require('./routes/deviceRoutes');
 const clientRoutes = require('./routes/clientRoutes');
 const emailRoutes = require('./routes/emailRoutes');
+const reportScheduleRoutes = require('./routes/reportScheduleRoutes');
 
 
 const app = express();
@@ -58,5 +59,12 @@ app.use('/api/clients', clientRoutes);
 // Email routes
 app.use('/api', verifyToken, emailRoutes);
 
+// Report Schedule routes
+app.use('/api/report-schedule', verifyToken, reportScheduleRoutes);
+
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+const { startScheduler } = require('./services/reportScheduler');
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+  startScheduler();
+});
