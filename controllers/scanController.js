@@ -1,6 +1,8 @@
 const db = require('../config/db');
 const historyController = require('./historyController');
 
+const STRICT_CORE = false; // true = refuse to form a set if Pallet, Sleeve or Lid is missing
+
 // ── 1. DISPATCH SCAN (Moving from Plant to Customer) ──
 exports.dispatchScan = async (req, res) => {
     const { set_id, scanned_rfid_tags, vehicle_type = 'Motorcycle', destination_location_id = 5 } = req.body;
@@ -199,7 +201,8 @@ exports.unifiedScan = async (req, res) => {
         destination_location_id = 5, 
         vehicle_no = 'NA', 
         driver_name = 'NA',
-        action = 'dispatch' // ✅ dispatch, receive, or return
+        action = 'dispatch', // ✅ dispatch, receive, or return
+        vehicle_type: forcedVehicle = null
     } = req.body;
 
     if (!scanned_rfid_tags || scanned_rfid_tags.length === 0) {
@@ -227,13 +230,13 @@ exports.unifiedScan = async (req, res) => {
         // ── A. PROCESS SETS (Single or Bulk) ──
         if (setIds.length > 0) {
             // Verify sets are in the correct status based on action
-            let expectedStatus = 'assembled';
-            if (action === 'receive') expectedStatus = 'dispatched';
-            if (action === 'return') expectedStatus = 'dispatched'; // or 'received'
+            let expectedStatuses = ['assembled'];
+            if (action === 'receive') expectedStatuses = ['dispatched'];
+            if (action === 'return') expectedStatuses = ['dispatched', 'received'];
 
             const [validSets] = await conn.query(
-                'SELECT set_id, vehicle_type FROM containers WHERE set_id IN (?) AND status = ?',
-                [setIds, expectedStatus]
+                'SELECT set_id, vehicle_type FROM containers WHERE set_id IN (?) AND status IN (?)',
+                [setIds, expectedStatuses]
             );
             
             // Move invalid sets to looseComponents if they don't match the expected status
@@ -321,53 +324,88 @@ exports.unifiedScan = async (req, res) => {
                 return acc;
             }, {});
 
-            const SET_RECIPES = {
-                Motorcycle: { 'Pallet': 1, 'Lid': 1, 'Layer Pad': 2, 'Insert': 2 },
-                Scooter:    { 'Pallet': 1, 'Lid': 1, 'Layer Pad': 3, 'Insert': 3 }
+            // ── FLEXIBLE ASSEMBLY: the number of INSERTS decides the vehicle ──
+            // Every set has exactly 1 Pallet, 1 Sleeve, 1 Lid.
+            const forcedVehicle  = req.body.vehicle_type || null; // optional: 'Motorcycle' | 'Scooter'
+            const INSERTS_PER    = { Motorcycle: 2, Scooter: 3 };
+            const LAYER_PADS_PER = { Motorcycle: 2, Scooter: 3 };
+
+            const splitInserts = (n, forced) => {
+                const sizes = [];
+                if (forced && INSERTS_PER[forced]) {
+                    const k = INSERTS_PER[forced];
+                    for (let used = 0; used + k <= n; used += k) sizes.push(k);
+                    return sizes;
+                }
+                while (n >= 2) {
+                    if (n % 2 === 0) { sizes.push(2); n -= 2; }
+                    else             { sizes.push(3); n -= 3; }
+                }
+                return sizes; // a single leftover insert stays loose
             };
 
-            let matchedVehicle = null;
-            let setsToMake = 0;
-
-            for (const [vehicleType, recipe] of Object.entries(SET_RECIPES)) {
-                let possibleSets = Infinity;
-                for (const [type, qty] of Object.entries(recipe)) {
-                    const scanned = scannedCounts[type] || 0;
-                    possibleSets = Math.min(possibleSets, Math.floor(scanned / qty));
+            // takes up to `max` parts of a type out of looseComponents
+            const take = (type, max) => {
+                const got = [];
+                for (let j = 0; j < looseComponents.length && got.length < max; j++) {
+                    if (looseComponents[j].type === type) {
+                        got.push(looseComponents[j]);
+                        looseComponents.splice(j, 1);
+                        j--;
+                    }
                 }
-                if (possibleSets > 0) {
-                    matchedVehicle = vehicleType;
-                    setsToMake = possibleSets;
-                    break;
-                }
-            }
+                return got;
+            };
 
-            if (matchedVehicle && setsToMake > 0 && action === 'dispatch') {
-                // ✅ AUTO-ASSEMBLY TRIGGERED (ONLY FOR DISPATCH)
-                const recipe = SET_RECIPES[matchedVehicle];
-                for (let i = 0; i < setsToMake; i++) {
+            if (action === 'dispatch') {
+                const insertCount = looseComponents.filter(c => c.type === 'Insert').length;
+                const sizes = splitInserts(insertCount, forcedVehicle);
+
+                for (let i = 0; i < sizes.length; i++) {
+                    const matchedVehicle = sizes[i] === 3 ? 'Scooter' : 'Motorcycle';
                     const prefix = matchedVehicle === 'Scooter' ? 'FLC-S' : 'FLC-M';
                     const newSetId = `${prefix}-${Math.floor(1000 + Math.random() * 9000)}`;
-                    
-                    const setComponents = [];
-                    for (const [type, qty] of Object.entries(recipe)) {
-                        let found = 0;
-                        for (let j = 0; j < looseComponents.length && found < qty; j++) {
-                            if (looseComponents[j].type === type) {
-                                setComponents.push(looseComponents[j]);
-                                looseComponents.splice(j, 1);
-                                j--; found++;
-                            }
-                        }
-                    }
 
+                    const setComponents = [
+                        ...take('Insert', sizes[i]),
+                        ...take('Pallet', 1),
+                        ...take('Sleeve', 1),
+                        ...take('Lid', 1),
+                        ...take('Layer Pad', LAYER_PADS_PER[matchedVehicle]),
+                    ];
                     const setAssetIds = setComponents.map(c => c.asset_id);
+
+                    // what is missing? (tracked)
+                    const have = setComponents.reduce((a, c) => { a[c.type] = (a[c.type] || 0) + 1; return a; }, {});
+                    const missing = [];
+                    if (!have['Pallet']) missing.push('Pallet');
+                    if (!have['Sleeve']) missing.push('Sleeve');
+                    if (!have['Lid'])    missing.push('Lid');
+                    if (STRICT_CORE && missing.length) {
+                        throw new Error(`Cannot form ${matchedVehicle} set. Missing: ${missing.join(', ')}`);
+                    }
+                    const padsMissing = LAYER_PADS_PER[matchedVehicle] - (have['Layer Pad'] || 0);
+                    if (padsMissing > 0) missing.push(`Layer Pad x${padsMissing}`);
+
+                    const baseNote = `Auto-assembled by inserts (${matchedVehicle})`;
+                    const note = missing.length ? `${baseNote}. Missing: ${missing.join(', ')}` : baseNote;
 
                     await conn.query(
                         'INSERT INTO containers (set_id, vehicle_type, status, current_location_id, dispatch_time) VALUES (?, ?, "dispatched", ?, NOW())',
                         [newSetId, matchedVehicle, destination_location_id]
                     );
-                    await conn.query('UPDATE components SET set_id = ?, status = "in_use", current_location_id = ? WHERE asset_id IN (?)', [newSetId, destination_location_id, setAssetIds]);
+                    await conn.query(
+                        'UPDATE components SET set_id = ?, status = "in_use", current_location_id = ? WHERE asset_id IN (?)',
+                        [newSetId, destination_location_id, setAssetIds]
+                    );
+
+                    if (missing.length) {
+                        const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
+                        await conn.query(
+                            'INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)',
+                            [excId, newSetId, `Set formed with missing parts: ${missing.join(', ')}`]
+                        );
+                    }
 
                     const autoChallanNo = `DC-AUTO-${Date.now().toString().slice(-6)}-${i}`;
                     const [challanResult] = await conn.query(
@@ -377,7 +415,7 @@ exports.unifiedScan = async (req, res) => {
                     await conn.query('INSERT INTO challan_sets (challan_id, set_id) VALUES (?, ?)', [challanResult.insertId, newSetId]);
 
                     for (const comp of setComponents) {
-                        await historyController.logHistory('ASSEMBLED', comp.asset_id, { set_id: newSetId, location_id: destination_location_id }, conn);
+                        await historyController.logHistory('ASSEMBLED', comp.asset_id, { set_id: newSetId, location_id: destination_location_id, note }, conn);
                         await historyController.logHistory('DISPATCHED', comp.asset_id, { set_id: newSetId, challan_no: autoChallanNo, location_id: destination_location_id }, conn);
                     }
                     setsDispatched.push(newSetId);

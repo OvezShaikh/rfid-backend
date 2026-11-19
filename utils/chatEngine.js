@@ -4,7 +4,7 @@ async function processChatQuery(message) {
   const text = (message || '').trim().toLowerCase();
 
   try {
-    const idMatch = message.match(/\b([A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+)\b/i);
+    const idMatch = (message || '').match(/\b(?=[A-Z0-9_-]*\d)([A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)*)\b/i);
 
     if (idMatch) {
       const searchId = idMatch[1].toUpperCase();
@@ -73,7 +73,7 @@ async function processChatQuery(message) {
     }
 
     // ── Default ──
-    return `🤖 *Unostar RFID Assistant*\n\nI can help you track assets. Try typing:\n\n🔍 1. "Where is FLC-M-8869?"\n📦 2. "Status of PAD-TRK-02_B"\n🚨 3. "Show open exceptions"`;
+    return `🤖 *Unostar RFID Assistant*\n\nI can help you track assets. Try typing:\n\n🔍 1. "Where is FLC-M-8869?"\n📦 2. "Status of PAD0050"\n🚨 3. "Show open exceptions"`;
 
   } catch (err) {
     console.error('Chat engine error:', err);
