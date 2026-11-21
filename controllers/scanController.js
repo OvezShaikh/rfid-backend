@@ -292,7 +292,7 @@ exports.unifiedScan = async (req, res) => {
                         if (missingParts.length > 0) {
                             const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
                             const missingTypes = missingParts.map(p => p.type).join(', ');
-                            await db.query('INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)', [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`]);
+                            await conn.query('INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)', [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`]);
                             throw new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`);
                         }
                     }
@@ -468,7 +468,7 @@ exports.bulkReceive = async (req, res) => {
         await conn.beginTransaction();
         
         const uniqueTags = [...new Set(scanned_rfid_tags)];
-        const [components] = await conn.query('SELECT set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
+        const [components] = await conn.query('SELECT asset_id, set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
         const setIds = [...new Set(components.map(c => c.set_id).filter(id => id))];
 
         if (setIds.length === 0) throw new Error('No valid sets found for the scanned tags.');
@@ -483,7 +483,7 @@ exports.bulkReceive = async (req, res) => {
         await conn.query('UPDATE containers SET status = "received", received_at = NOW() WHERE set_id IN (?)', [setIds]);
         
         // Log history for every component
-        const [setComps] = await conn.query('SELECT asset_id FROM components WHERE set_id IN (?)', [setIds]);
+        const [setComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
         for (const comp of setComps) {
             await historyController.logHistory('RECEIVED', comp.asset_id, { 
                 set_id: comp.set_id,
@@ -519,6 +519,7 @@ exports.bulkReturn = async (req, res) => {
         if (validSets.length !== setIds.length) throw new Error('One or more sets are not in a returnable state.');
 
         const originLocationId = validSets[0].current_location_id;
+        const [componentsBeforeReturn] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
 
         // 1. Update container statuses to returned
         await conn.query(
@@ -534,7 +535,7 @@ exports.bulkReturn = async (req, res) => {
                 [return_location_id, setIds]
             );
             // Log Auto-Disassembly for all components
-            const [allComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
+            const allComps = componentsBeforeReturn;
             for (const comp of allComps) {
                 await historyController.logHistory('DISASSEMBLED', comp.asset_id, { 
                     set_id: comp.set_id,
@@ -548,7 +549,7 @@ exports.bulkReturn = async (req, res) => {
         }
         
         // Log Return history
-        const [setComps] = await conn.query('SELECT asset_id FROM components WHERE set_id IN (?)', [setIds]);
+        const setComps = componentsBeforeReturn;
         for (const comp of setComps) {
             await historyController.logHistory('RETURNED', comp.asset_id, { 
                 set_id: comp.set_id,
