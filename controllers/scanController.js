@@ -146,6 +146,7 @@ exports.returnScan = async (req, res) => {
         }
 
         const originLocationId = set.current_location_id;
+        const [componentsBeforeReturn] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id = ?', [set_id]);
 
         // 1. Update container status to returned
         await conn.query(
@@ -161,7 +162,7 @@ exports.returnScan = async (req, res) => {
                 [return_location_id, set_id]
             );
             // Log Auto-Disassembly
-            const [components] = await conn.query('SELECT asset_id FROM components WHERE set_id = ?', [set_id]);
+            const components = componentsBeforeReturn;
             for (const comp of components) {
                 await historyController.logHistory('DISASSEMBLED', comp.asset_id, { 
                     set_id: set_id,
@@ -175,7 +176,7 @@ exports.returnScan = async (req, res) => {
         }
         
         // Log Return history for the set itself
-        const [components] = await conn.query('SELECT asset_id FROM components WHERE set_id = ?', [set_id]);
+        const components = componentsBeforeReturn;
         for (const comp of components) {
             await historyController.logHistory('RETURNED', comp.asset_id, { 
                 set_id,
