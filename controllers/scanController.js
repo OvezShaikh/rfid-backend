@@ -293,8 +293,11 @@ exports.unifiedScan = async (req, res) => {
                         if (missingParts.length > 0) {
                             const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
                             const missingTypes = missingParts.map(p => p.type).join(', ');
-                            await conn.query('INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)', [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`]);
-                            throw new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`);
+                            const exceptionReason = `Gate scan incomplete. Missing: ${missingTypes}`;
+                            throw Object.assign(
+                                new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`),
+                                { pendingException: { exception_id: excId, set_id: setId, reason: exceptionReason } }
+                            );
                         }
                     }
 
@@ -453,6 +456,19 @@ exports.unifiedScan = async (req, res) => {
 
     } catch (err) {
         await conn.rollback();
+        // Persist the exception only after rolling back the failed scan transaction.
+        // This keeps inventory changes atomic without losing the exception record.
+        if (err.pendingException) {
+            try {
+                const e = err.pendingException;
+                await db.query(
+                    'INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)',
+                    [e.exception_id, e.set_id, e.reason]
+                );
+            } catch (exceptionError) {
+                console.error('Failed to persist scan exception:', exceptionError);
+            }
+        }
         res.status(400).json({ error: err.message });
     } finally {
         conn.release();
