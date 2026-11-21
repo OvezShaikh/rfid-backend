@@ -146,6 +146,7 @@ exports.returnScan = async (req, res) => {
         }
 
         const originLocationId = set.current_location_id;
+        const [componentsBeforeReturn] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id = ?', [set_id]);
 
         // 1. Update container status to returned
         await conn.query(
@@ -161,7 +162,7 @@ exports.returnScan = async (req, res) => {
                 [return_location_id, set_id]
             );
             // Log Auto-Disassembly
-            const [components] = await conn.query('SELECT asset_id FROM components WHERE set_id = ?', [set_id]);
+            const components = componentsBeforeReturn;
             for (const comp of components) {
                 await historyController.logHistory('DISASSEMBLED', comp.asset_id, { 
                     set_id: set_id,
@@ -175,7 +176,7 @@ exports.returnScan = async (req, res) => {
         }
         
         // Log Return history for the set itself
-        const [components] = await conn.query('SELECT asset_id FROM components WHERE set_id = ?', [set_id]);
+        const components = componentsBeforeReturn;
         for (const comp of components) {
             await historyController.logHistory('RETURNED', comp.asset_id, { 
                 set_id,
@@ -292,8 +293,11 @@ exports.unifiedScan = async (req, res) => {
                         if (missingParts.length > 0) {
                             const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
                             const missingTypes = missingParts.map(p => p.type).join(', ');
-                            await db.query('INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)', [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`]);
-                            throw new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`);
+                            const exceptionReason = `Gate scan incomplete. Missing: ${missingTypes}`;
+                            throw Object.assign(
+                                new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`),
+                                { pendingException: { exception_id: excId, set_id: setId, reason: exceptionReason } }
+                            );
                         }
                     }
 
@@ -452,6 +456,19 @@ exports.unifiedScan = async (req, res) => {
 
     } catch (err) {
         await conn.rollback();
+        // Persist the exception only after rolling back the failed scan transaction.
+        // This keeps inventory changes atomic without losing the exception record.
+        if (err.pendingException) {
+            try {
+                const e = err.pendingException;
+                await db.query(
+                    'INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)',
+                    [e.exception_id, e.set_id, e.reason]
+                );
+            } catch (exceptionError) {
+                console.error('Failed to persist scan exception:', exceptionError);
+            }
+        }
         res.status(400).json({ error: err.message });
     } finally {
         conn.release();
@@ -468,7 +485,7 @@ exports.bulkReceive = async (req, res) => {
         await conn.beginTransaction();
         
         const uniqueTags = [...new Set(scanned_rfid_tags)];
-        const [components] = await conn.query('SELECT set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
+        const [components] = await conn.query('SELECT asset_id, set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
         const setIds = [...new Set(components.map(c => c.set_id).filter(id => id))];
 
         if (setIds.length === 0) throw new Error('No valid sets found for the scanned tags.');
@@ -483,7 +500,7 @@ exports.bulkReceive = async (req, res) => {
         await conn.query('UPDATE containers SET status = "received", received_at = NOW() WHERE set_id IN (?)', [setIds]);
         
         // Log history for every component
-        const [setComps] = await conn.query('SELECT asset_id FROM components WHERE set_id IN (?)', [setIds]);
+        const [setComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
         for (const comp of setComps) {
             await historyController.logHistory('RECEIVED', comp.asset_id, { 
                 set_id: comp.set_id,
@@ -510,7 +527,7 @@ exports.bulkReturn = async (req, res) => {
         await conn.beginTransaction();
         
         const uniqueTags = [...new Set(scanned_rfid_tags)];
-        const [components] = await conn.query('SELECT set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
+        const [components] = await conn.query('SELECT asset_id, set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
         const setIds = [...new Set(components.map(c => c.set_id).filter(id => id))];
 
         if (setIds.length === 0) throw new Error('No valid sets found for the scanned tags.');
@@ -519,6 +536,7 @@ exports.bulkReturn = async (req, res) => {
         if (validSets.length !== setIds.length) throw new Error('One or more sets are not in a returnable state.');
 
         const originLocationId = validSets[0].current_location_id;
+        const [componentsBeforeReturn] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
 
         // 1. Update container statuses to returned
         await conn.query(
@@ -534,7 +552,7 @@ exports.bulkReturn = async (req, res) => {
                 [return_location_id, setIds]
             );
             // Log Auto-Disassembly for all components
-            const [allComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
+            const allComps = componentsBeforeReturn;
             for (const comp of allComps) {
                 await historyController.logHistory('DISASSEMBLED', comp.asset_id, { 
                     set_id: comp.set_id,
@@ -548,7 +566,7 @@ exports.bulkReturn = async (req, res) => {
         }
         
         // Log Return history
-        const [setComps] = await conn.query('SELECT asset_id FROM components WHERE set_id IN (?)', [setIds]);
+        const setComps = componentsBeforeReturn;
         for (const comp of setComps) {
             await historyController.logHistory('RETURNED', comp.asset_id, { 
                 set_id: comp.set_id,
