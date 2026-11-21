@@ -510,7 +510,7 @@ exports.bulkReturn = async (req, res) => {
         await conn.beginTransaction();
         
         const uniqueTags = [...new Set(scanned_rfid_tags)];
-        const [components] = await conn.query('SELECT set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
+        const [components] = await conn.query('SELECT asset_id, set_id FROM components WHERE rfid_tag_id IN (?)', [uniqueTags]);
         const setIds = [...new Set(components.map(c => c.set_id).filter(id => id))];
 
         if (setIds.length === 0) throw new Error('No valid sets found for the scanned tags.');
