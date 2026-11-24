@@ -105,3 +105,65 @@ exports.updateUser = async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 };
+
+// 5. Update OWN Profile (For the logged-in user)
+exports.updateOwnProfile = async (req, res) => {
+    const { username } = req.body;
+    const userId = req.user.id;
+
+    if (!username || username.trim() === '') {
+        return res.status(400).json({ error: 'Username cannot be empty.' });
+    }
+
+    try {
+        // Check if the new username is already taken by someone else
+        const [existing] = await db.query('SELECT id FROM users WHERE username = ? AND id != ?', [username, userId]);
+        if (existing.length > 0) return res.status(400).json({ error: 'Username is already taken.' });
+
+        await db.query('UPDATE users SET username = ? WHERE id = ?', [username, userId]);
+        
+        // Fetch updated user data to send back to frontend
+        const [updatedUser] = await db.query(`
+            SELECT u.id, u.username, u.role_id, r.name as role_name 
+            FROM users u JOIN roles r ON u.role_id = r.id 
+            WHERE u.id = ?
+        `, [userId]);
+
+        res.json({ success: true, message: 'Profile updated', user: updatedUser[0] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
+// 6. Change OWN Password (For the logged-in user)
+exports.updateOwnPassword = async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    const userId = req.user.id;
+
+    if (!currentPassword || !newPassword) {
+        return res.status(400).json({ error: 'Please provide current and new passwords.' });
+    }
+
+    if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+    }
+
+    try {
+        const [users] = await db.query('SELECT password_hash FROM users WHERE id = ?', [userId]);
+        if (users.length === 0) return res.status(404).json({ error: 'User not found.' });
+
+        // Verify current password
+        const isMatch = await bcrypt.compare(currentPassword, users[0].password_hash);
+        if (!isMatch) return res.status(400).json({ error: 'Incorrect current password.' });
+
+        // Hash and save new password
+        const salt = await bcrypt.genSalt(10);
+        const hash = await bcrypt.hash(newPassword, salt);
+
+        await db.query('UPDATE users SET password_hash = ? WHERE id = ?', [hash, userId]);
+        
+        res.json({ success: true, message: 'Password updated successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};

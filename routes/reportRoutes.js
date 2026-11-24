@@ -11,4 +11,9 @@ router.get('/turnaround', reportController.getTurnaroundTime);
 router.get('/location-stock', reportController.getLocationStock);
 router.get('/exception-rate', reportController.getExceptionRate);
 
+// Stuck in Transit, Daily Movement, and Audit Exceptions are accessible to all authenticated users
+router.get('/stuck-in-transit', reportController.getStuckInTransit);
+router.get('/daily-movement', reportController.getDailyMovement);
+router.get('/audit-exceptions', reportController.getAuditExceptions);
+
 module.exports = router;

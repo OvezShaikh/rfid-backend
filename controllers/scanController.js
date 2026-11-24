@@ -197,12 +197,14 @@ exports.returnScan = async (req, res) => {
 // ── UNIFIED SCAN (Handles Loose Assets, Single Sets, and Bulk Trucks) ──
 exports.unifiedScan = async (req, res) => {
     const { 
-        scanned_rfid_tags, 
+        scanned_rfid_tags,
+        source_location_id = 2, // ✅ Defaults to 2 (Minda Plant) if not sent
         destination_location_id = 5, 
         vehicle_no = 'NA', 
         driver_name = 'NA',
-        action = 'dispatch', // ✅ dispatch, receive, or return
-        vehicle_type: forcedVehicle = null
+        action = 'dispatch', 
+        vehicle_type: forcedVehicle = null,
+        operator_id = 1 
     } = req.body;
 
     if (!scanned_rfid_tags || scanned_rfid_tags.length === 0) {
@@ -221,6 +223,14 @@ exports.unifiedScan = async (req, res) => {
 
         if (components.length === 0) throw new Error('No registered components found for the scanned tags.');
 
+        // ✅ LOG EVERY SINGLE TAG SCAN
+        for (const tag of uniqueTags) {
+            await conn.query(
+                'INSERT INTO scan_logs (tag_id, action_type, vehicle_no, location_id, operator_id) VALUES (?, ?, ?, ?, ?)',
+                [tag, action.toUpperCase(), vehicle_no, destination_location_id, operator_id]
+            );
+        }
+
         const setIds = [...new Set(components.filter(c => c.set_id).map(c => c.set_id))];
         const looseComponents = components.filter(c => !c.set_id);
 
@@ -229,7 +239,6 @@ exports.unifiedScan = async (req, res) => {
 
         // ── A. PROCESS SETS (Single or Bulk) ──
         if (setIds.length > 0) {
-            // Verify sets are in the correct status based on action
             let expectedStatuses = ['assembled'];
             if (action === 'receive') expectedStatuses = ['dispatched'];
             if (action === 'return') expectedStatuses = ['dispatched', 'received'];
@@ -239,7 +248,6 @@ exports.unifiedScan = async (req, res) => {
                 [setIds, expectedStatuses]
             );
             
-            // Move invalid sets to looseComponents if they don't match the expected status
             if (validSets.length !== setIds.length) {
                 const validSetIds = validSets.map(s => s.set_id);
                 const invalidComponents = components.filter(c => c.set_id && !validSetIds.includes(c.set_id));
@@ -248,7 +256,6 @@ exports.unifiedScan = async (req, res) => {
                 setIds.push(...validSetIds);
             }
 
-            // If we have valid sets, process them
             if (setIds.length > 0) {
                 if (action === 'receive') {
                     // ── RECEIVING A SET ──
@@ -263,22 +270,49 @@ exports.unifiedScan = async (req, res) => {
                     }
                 } else if (action === 'return') {
                     // ── RETURNING A SET ──
-                    await conn.query('UPDATE containers SET status = "returned", returned_at = NOW(), current_location_id = ? WHERE set_id IN (?)', [destination_location_id, setIds]);
-                    if (destination_location_id === 1) {
-                        await conn.query('UPDATE components SET current_location_id = ?, set_id = NULL, status = "available" WHERE set_id IN (?)', [destination_location_id, setIds]);
-                        const [allComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
-                        for (const comp of allComps) {
-                            await historyController.logHistory('DISASSEMBLED', comp.asset_id, { set_id: comp.set_id, location_id: destination_location_id, note: 'Auto-disassembled at Warehouse' }, conn);
+                    
+                    // 1. Fetch components BEFORE unlinking
+                    const [setComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
+
+                    // 2. Get the return location details from DB
+                    const [locRows] = await conn.query('SELECT location_name, is_disassembly_hub FROM locations WHERE id = ?', [destination_location_id]);
+                    const returnLocation = locRows[0];
+                    const isHub = returnLocation?.is_disassembly_hub;
+
+                    // 3. Update container status and move to the SELECTED destination
+                    await conn.query(
+                        'UPDATE containers SET status = "returned", returned_at = NOW(), current_location_id = ? WHERE set_id IN (?)', 
+                        [destination_location_id, setIds]
+                    );
+                    
+                    // 4. Check if the destination is a disassembly hub
+                    if (isHub) {
+                        // Log DISASSEMBLED first
+                        for (const comp of setComps) {
+                            await historyController.logHistory('DISASSEMBLED', comp.asset_id, { 
+                                set_id: comp.set_id, 
+                                location_id: destination_location_id, 
+                                note: `Auto-disassembled at ${returnLocation.location_name}` 
+                            }, conn);
                         }
+                        
+                        // Now unlink them and make available
+                        await conn.query('UPDATE components SET current_location_id = ?, set_id = NULL, status = "available" WHERE set_id IN (?)', [destination_location_id, setIds]);
                     } else {
+                        // If returning to a non-hub (like Papl), keep the set assembled but move it
                         await conn.query('UPDATE components SET current_location_id = ? WHERE set_id IN (?)', [destination_location_id, setIds]);
                     }
-                    const [setComps] = await conn.query('SELECT asset_id, set_id FROM components WHERE set_id IN (?)', [setIds]);
+                    
+                    // 5. Log the RETURNED event dynamically
                     for (const comp of setComps) {
-                        await historyController.logHistory('RETURNED', comp.asset_id, { set_id: comp.set_id, location_id: destination_location_id, note: 'Returned via Handheld' }, conn);
+                        await historyController.logHistory('RETURNED', comp.asset_id, { 
+                            set_id: comp.set_id, 
+                            location_id: destination_location_id, 
+                            note: `Returned to ${returnLocation?.location_name || 'Location'}` 
+                        }, conn);
                     }
                 } else {
-                    // ── DISPATCHING A SET (Existing logic) ──
+                    // ── DISPATCHING A SET ──
                     const [allDbComponents] = await conn.query('SELECT set_id, rfid_tag_id, type FROM components WHERE set_id IN (?)', [setIds]);
                     const dbCompMap = allDbComponents.reduce((acc, curr) => {
                         if (!acc[curr.set_id]) acc[curr.set_id] = [];
@@ -289,18 +323,32 @@ exports.unifiedScan = async (req, res) => {
                     for (const setId of setIds) {
                         const expectedParts = dbCompMap[setId] || [];
                         const missingParts = expectedParts.filter(c => !uniqueTags.includes(c.rfid_tag_id));
+                        
                         if (missingParts.length > 0) {
                             const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
                             const missingTypes = missingParts.map(p => p.type).join(', ');
-                            await db.query('INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)', [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`]);
+                            
+                            await conn.query(
+                                'INSERT INTO exceptions (exception_id, set_id, reason, status, owner_role) VALUES (?, ?, ?, ?, ?)', 
+                                [excId, setId, `Gate scan incomplete. Missing: ${missingTypes}`, 'open', 'supervisor']
+                            );
+                            
+                            await conn.query(
+                                'INSERT INTO audit_logs (action_type, entity_id, user_id, details) VALUES (?, ?, ?, ?)',
+                                ['INCOMPLETE_DISPATCH', setId, operator_id, JSON.stringify({ message: `Set missing: ${missingTypes}`, exception_id: excId })]
+                            );
+
                             throw new Error(`Incomplete Set ${setId}. Missing: ${missingTypes}. Exception ${excId} generated.`);
                         }
                     }
 
                     challanNo = `DC-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+                    
+                    // ✅ FIXED: Uses dynamic source_location_id and destination_location_id
                     const [challanResult] = await conn.query(
-                        `INSERT INTO delivery_challans (challan_no, from_location_id, to_location_id, vehicle_no, driver_name, status) VALUES (?, 2, ?, ?, ?, 'dispatched')`,
-                        [challanNo, destination_location_id, vehicle_no, driver_name]
+                        `INSERT INTO delivery_challans (challan_no, from_location_id, to_location_id, vehicle_no, driver_name, status) 
+                         VALUES (?, ?, ?, ?, ?, 'dispatched')`,
+                        [challanNo, source_location_id, destination_location_id, vehicle_no, driver_name]
                     );
                     
                     const challanId = challanResult.insertId;
@@ -324,9 +372,7 @@ exports.unifiedScan = async (req, res) => {
                 return acc;
             }, {});
 
-            // ── FLEXIBLE ASSEMBLY: the number of INSERTS decides the vehicle ──
-            // Every set has exactly 1 Pallet, 1 Sleeve, 1 Lid.
-            const forcedVehicle  = req.body.vehicle_type || null; // optional: 'Motorcycle' | 'Scooter'
+            const forcedVehicle  = req.body.vehicle_type || null; 
             const INSERTS_PER    = { Motorcycle: 2, Scooter: 3 };
             const LAYER_PADS_PER = { Motorcycle: 2, Scooter: 3 };
 
@@ -341,10 +387,9 @@ exports.unifiedScan = async (req, res) => {
                     if (n % 2 === 0) { sizes.push(2); n -= 2; }
                     else             { sizes.push(3); n -= 3; }
                 }
-                return sizes; // a single leftover insert stays loose
+                return sizes; 
             };
 
-            // takes up to `max` parts of a type out of looseComponents
             const take = (type, max) => {
                 const got = [];
                 for (let j = 0; j < looseComponents.length && got.length < max; j++) {
@@ -375,7 +420,6 @@ exports.unifiedScan = async (req, res) => {
                     ];
                     const setAssetIds = setComponents.map(c => c.asset_id);
 
-                    // what is missing? (tracked)
                     const have = setComponents.reduce((a, c) => { a[c.type] = (a[c.type] || 0) + 1; return a; }, {});
                     const missing = [];
                     if (!have['Pallet']) missing.push('Pallet');
@@ -399,18 +443,27 @@ exports.unifiedScan = async (req, res) => {
                         [newSetId, destination_location_id, setAssetIds]
                     );
 
+                    const autoChallanNo = `DC-AUTO-${Date.now().toString().slice(-6)}-${i}`;
+                    
                     if (missing.length) {
                         const excId = 'EXC-' + Math.floor(1000 + Math.random() * 9000);
+                        
                         await conn.query(
-                            'INSERT INTO exceptions (exception_id, set_id, reason) VALUES (?, ?, ?)',
-                            [excId, newSetId, `Set formed with missing parts: ${missing.join(', ')}`]
+                            'INSERT INTO exceptions (exception_id, set_id, reason, status, owner_role) VALUES (?, ?, ?, ?, ?)',
+                            [excId, newSetId, `Set formed with missing parts: ${missing.join(', ')}`, 'open', 'supervisor']
+                        );
+
+                        await conn.query(
+                            'INSERT INTO audit_logs (action_type, entity_id, user_id, details) VALUES (?, ?, ?, ?)',
+                            ['INCOMPLETE_AUTO_ASSEMBLY', newSetId, operator_id, JSON.stringify({ message: `Set formed missing: ${missing.join(', ')}`, challan_no: autoChallanNo })]
                         );
                     }
 
-                    const autoChallanNo = `DC-AUTO-${Date.now().toString().slice(-6)}-${i}`;
+                    // ✅ FIXED: Uses dynamic source_location_id and destination_location_id
                     const [challanResult] = await conn.query(
-                        `INSERT INTO delivery_challans (challan_no, from_location_id, to_location_id, vehicle_no, driver_name, status) VALUES (?, 1, ?, 'Auto', 'System', 'dispatched')`,
-                        [autoChallanNo, destination_location_id]
+                        `INSERT INTO delivery_challans (challan_no, from_location_id, to_location_id, vehicle_no, driver_name, status) 
+                         VALUES (?, ?, ?, 'Auto', 'System', 'dispatched')`,
+                        [autoChallanNo, source_location_id, destination_location_id]
                     );
                     await conn.query('INSERT INTO challan_sets (challan_id, set_id) VALUES (?, ?)', [challanResult.insertId, newSetId]);
 
@@ -422,10 +475,9 @@ exports.unifiedScan = async (req, res) => {
                 }
             }
 
-            // 4. Process any remaining loose components
+            // Process any remaining loose components
             if (looseComponents.length > 0) {
                 const looseIds = looseComponents.map(c => c.asset_id);
-                // ✅ FIX: If receiving or returning, make them available so they can be reused. If dispatching, make them in_use.
                 const newLooseStatus = (action === 'receive' || action === 'return') ? 'available' : 'in_use';
                 await conn.query(
                     'UPDATE components SET current_location_id = ?, status = ? WHERE asset_id IN (?)',
