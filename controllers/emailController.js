@@ -1,77 +1,77 @@
 // controllers/emailController.js
-const nodemailer = require('nodemailer');
-const db = require('../config/db'); // Your MySQL connection
+const db = require('../config/db');
+const emailTrigger = require('../services/emailTrigger');
+const { buildDockTatWorkbook } = require('../services/dockTatReport');
 
-// Configure the transporter (e.g., for Brevo, Gmail, or standard SMTP)
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp-relay.brevo.com', 
-  port: process.env.SMTP_PORT || 587,
-  auth: {
-    user: process.env.SMTP_USER, // Your Brevo login
-    pass: process.env.SMTP_PASS, // Your Brevo API Key or SMTP password
-  },
-});
-
-// 1. Get saved recipients
+// 1. Get saved recipients (legacy — kept for the existing card)
 exports.getSettings = async (req, res) => {
   try {
-    const [rows] = await db.query(`SELECT setting_value FROM settings WHERE setting_key = 'email_recipients'`);
+    const [rows] = await db.query(
+      `SELECT setting_value FROM settings WHERE setting_key = 'email_recipients'`
+    );
     const recipients = rows.length ? JSON.parse(rows[0].setting_value) : [];
     res.json({ recipients });
   } catch (error) {
-    console.error('DB Error in getSettings:', error); // ADD THIS
+    console.error('DB Error in getSettings:', error);
     res.status(500).json({ error: 'Failed to fetch settings', details: error.message });
   }
 };
 
-// 2. Save recipients
+// 2. Save recipients (legacy)
 exports.saveSettings = async (req, res) => {
   const { recipients } = req.body;
   try {
-    // Insert or Update the JSON array in the DB
     await db.query(`
-      INSERT INTO settings (setting_key, setting_value) 
-      VALUES ('email_recipients', ?) 
+      INSERT INTO settings (setting_key, setting_value)
+      VALUES ('email_recipients', ?)
       ON DUPLICATE KEY UPDATE setting_value = ?
     `, [JSON.stringify(recipients), JSON.stringify(recipients)]);
-    
     res.json({ success: true, message: 'Saved successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to save settings' });
   }
 };
 
-// 3. Send the email
+// 3. Reusable: build Dock TAT xlsx + send via trigger
+//    Called by HTTP handler AND scheduler.
+async function runDockTatReport({ recipients } = {}) {
+  const { buffer, totals, stamp } = await buildDockTatWorkbook();
+
+  const context = {
+    period_label: `Last 24 hours (${stamp})`,
+    total: totals.total,
+    open:  totals.open,
+    closed: totals.closed,
+    // Optional: override recipients when caller supplies them
+    ...(recipients && recipients.length ? { override_recipients: recipients } : {}),
+  };
+
+  const result = await emailTrigger.trigger(
+    'dock_tat_daily',
+    context,
+    { attachments: [{ filename: `DockTAT_${stamp}.xlsx`, content: buffer }] }
+  );
+
+  return { ...result, totals };
+}
+
+// 4. HTTP handler — supports both "test to given recipients" and "send to groups"
 exports.sendReport = async (req, res) => {
-  const { recipients } = req.body;
-
-  if (!recipients || recipients.length === 0) {
-    return res.status(400).json({ error: 'No recipients provided' });
-  }
-
+  const { recipients } = req.body || {};
   try {
-    // Email configuration
-    const mailOptions = {
-      from: `"${process.env.SMTP_FROM_NAME || 'RFID Tracking Pool'}" <${process.env.SMTP_FROM_EMAIL || 'info@unostar.in'}>`,
-      to: recipients.join(', '), // Array of recipient emails
-      subject: 'Daily Report: Last 24 Hours',
-      text: 'Hello,\n\nPlease find attached the daily report for the last 24 hours.\n\nRegards,\nSystem Admin',
-      // html: '<b>Hello</b>, please find the attached report.', // Optional HTML version
-      // attachments: [
-      //   {
-      //     filename: 'report.xlsx',
-      //     path: '/path/to/your/generated/report.xlsx' // You would generate this dynamically
-      //   }
-      // ]
-    };
-
-    // Send the email
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Email sent: ', info.messageId);
-
-    res.json({ success: true, message: 'Emails sent successfully!' });
+    const result = await runDockTatReport({ recipients });
+    if (result.skipped) {
+      return res.status(400).json({
+        success: false,
+        error: `Skipped: ${result.reason}. Check email_templates for event_key='dock_tat_daily' and recipient groups.`,
+      });
+    }
+    res.json({ success: !!result.sent, result });
   } catch (error) {
-    console.error('Email error:', error);
+    console.error('sendReport error:', error);
     res.status(500).json({ error: 'Failed to send email', details: error.message });
   }
 };
+
+// Export the reusable runner for scheduler / other callers
+exports.runDockTatReport = runDockTatReport;

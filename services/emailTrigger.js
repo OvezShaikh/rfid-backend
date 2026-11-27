@@ -67,12 +67,17 @@ async function trigger(eventKey, context, options = {}) {
   const tpl = tplRows[0];
 
   const locationId = context.location_id || context.from_location_id || context.to_location_id || null;
-  const recipients = await resolveRecipients(locationId);
+const recipients = await resolveRecipients(locationId);
 
-  if (recipients.length === 0) {
-    console.warn(`[email] no recipients for location ${locationId} on "${eventKey}" — skipping`);
-    return { skipped: true, reason: 'no recipients' };
-  }
+// ADDITIVE: allow caller to explicitly override recipients (e.g. "Send test email" button).
+// If not provided, behaviour is identical to before.
+const override = Array.isArray(context.override_recipients) ? context.override_recipients : null;
+const finalRecipients = override && override.length ? override : recipients;
+
+if (finalRecipients.length === 0) {
+  console.warn(`[email] no recipients for location ${locationId} on "${eventKey}" — skipping`);
+  return { skipped: true, reason: 'no recipients' };
+}
 
   const vars = {
     ...context,
@@ -87,14 +92,14 @@ async function trigger(eventKey, context, options = {}) {
   const [logResult] = await db.query(
     `INSERT INTO email_log (event_key, template_id, recipients, subject, status, context)
      VALUES (?, ?, ?, ?, 'pending', ?)`,
-    [eventKey, tpl.id, recipients.join(','), subject, JSON.stringify(context)]
+    [eventKey, tpl.id, finalRecipients.join(','), subject, JSON.stringify(context)]
   );
   const logId = logResult.insertId;
 
   try {
     const mailOptions = {
       from: `"${process.env.SMTP_FROM_NAME || 'RFID Tracking Pool'}" <${process.env.SMTP_FROM_EMAIL || 'info@unostar.in'}>`,
-      to: recipients.join(', '),
+      to: finalRecipients.join(', '),
       subject, text, html,
     };
 
@@ -119,8 +124,8 @@ async function trigger(eventKey, context, options = {}) {
       [info.messageId || null, logId]
     );
 
-    console.log(`[email] ${eventKey} → ${recipients.length} recipient(s) in ${Date.now() - startedAt}ms`);
-    return { sent: true, recipients: recipients.length, messageId: info.messageId, logId };
+    console.log(`[email] ${eventKey} → ${finalRecipients.length} recipient(s) in ${Date.now() - startedAt}ms`);
+    return { sent: true, recipients: finalRecipients.length, messageId: info.messageId, logId };
   } catch (err) {
     await db.query(
       `UPDATE email_log SET status='failed', error_message=? WHERE id=?`,
